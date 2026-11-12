@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   user_id uuid NOT NULL REFERENCES users(id),
   action varchar(32) NOT NULL CHECK (action IN (
-    'user.registered', 'user.logged_in', 'user.logged_out',
+    'user.registered', 'user.logged_in', 'user.logged_out', 'user.username_changed', 'user.password_changed',
     'task.created', 'task.updated', 'task.completed', 'task.cancelled', 'task.reopened', 'task.deleted'
   )),
   task_id uuid,

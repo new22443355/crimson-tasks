@@ -1,7 +1,8 @@
-import { DatabaseError, query } from "./db";
+import { DatabaseError, query, transaction } from "./db";
 import { digest, hashPassword, randomToken, sessionCookie, sessionToken, SESSION_AGE, verifyPassword } from "./security";
 
 type User = { id: string; username: string };
+type UserCredentials = User & { password_hash: string };
 type Task = {
   id: string; title: string; description: string; priority: "low" | "normal" | "high";
   dueDate: string | null; completed: boolean; cancelled: boolean; createdAt: string; updatedAt: string;
@@ -119,17 +120,84 @@ async function authenticate(request: Request, register: boolean): Promise<Respon
       throw error;
     }
   } else {
-    const rows = await query<User & { password_hash: string }>("SELECT id::text, username, password_hash FROM users WHERE username = $1", [username]);
+    const rows = await query<UserCredentials>("SELECT id::text, username, password_hash FROM users WHERE username = $1", [username]);
     const found = rows[0];
     const dummy = `pbkdf2_sha256$100000$00000000000000000000000000000000$${"0".repeat(64)}`;
     const valid = await verifyPassword(password, found?.password_hash ?? dummy);
     if (!found || !valid) throw new ApiError(401, "Неверный логин или пароль.");
-    user = { id: found.id, username: found.username };
-    await query(`WITH created AS (
-      INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3::timestamptz) RETURNING user_id
-    ) INSERT INTO audit_events (user_id, action) SELECT user_id, 'user.logged_in' FROM created`, [tokenHash, user.id, expires]);
+    user = await transaction(async tx => {
+      const [locked] = await tx<UserCredentials>("SELECT id::text, username, password_hash FROM users WHERE id = $1 FOR UPDATE", [found.id]);
+      if (!locked || locked.password_hash !== found.password_hash || locked.username !== username) throw new ApiError(401, "Неверный логин или пароль.");
+      await tx("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3::timestamptz)", [tokenHash, locked.id, expires]);
+      await tx("INSERT INTO audit_events (user_id, action) VALUES ($1, 'user.logged_in')", [locked.id]);
+      return { id: locked.id, username: locked.username };
+    });
   }
   return json({ user }, register ? 201 : 200, { "Set-Cookie": sessionCookie(request, token) });
+}
+
+function accountPassword(body: Record<string, unknown>, field: string): string {
+  const value = body[field];
+  if (typeof value !== "string" || value.length < 4 || value.length > 128) {
+    throw new ApiError(400, `${field === "currentPassword" ? "Текущий" : "Новый"} пароль должен содержать от 4 до 128 символов.`);
+  }
+  return value;
+}
+
+async function accountCredentials(user: User, password: string): Promise<UserCredentials> {
+  await throttle(`account:${user.id}`);
+  const [found] = await query<UserCredentials>("SELECT id::text, username, password_hash FROM users WHERE id = $1", [user.id]);
+  if (!found) throw new ApiError(401, "Войдите в аккаунт.");
+  if (!await verifyPassword(password, found.password_hash)) throw new ApiError(400, "Текущий пароль неверен.");
+  return found;
+}
+
+async function lockedAccount(tx: typeof query, verified: UserCredentials, tokenHash: string): Promise<UserCredentials> {
+  const [locked] = await tx<UserCredentials>("SELECT id::text, username, password_hash FROM users WHERE id = $1 FOR UPDATE", [verified.id]);
+  const sessions = await tx<{ token_hash: string }>("SELECT token_hash FROM sessions WHERE token_hash = $1 AND user_id = $2 AND expires_at > clock_timestamp()", [tokenHash, verified.id]);
+  if (!locked || !sessions.length) throw new ApiError(401, "Войдите в аккаунт.");
+  if (locked.password_hash !== verified.password_hash) throw new ApiError(409, "Данные аккаунта уже изменились. Повторите действие с текущим паролем.");
+  return locked;
+}
+
+async function updateAccount(request: Request, user: User, change: "username" | "password"): Promise<Response> {
+  const body = await readBody(request);
+  const allowed = new Set(["currentPassword", change === "username" ? "username" : "newPassword"]);
+  if (Object.keys(body).some(key => !allowed.has(key))) throw new ApiError(400, "Запрос содержит неизвестные поля.");
+  const currentPassword = accountPassword(body, "currentPassword");
+  const username = change === "username" ? body.username : null;
+  if (change === "username" && (typeof username !== "string" || !/^[a-zA-Z0-9_.-]{4,32}$/.test(username))) {
+    throw new ApiError(400, "Логин: 4–32 символа, латинские буквы, цифры, точка, дефис или подчёркивание.");
+  }
+  const newPassword = change === "password" ? accountPassword(body, "newPassword") : null;
+  const verified = await accountCredentials(user, currentPassword);
+  const token = sessionToken(request);
+  if (!token) throw new ApiError(401, "Войдите в аккаунт.");
+  const tokenHash = await digest(token);
+  const newHash = newPassword === null ? null : await hashPassword(newPassword);
+  try {
+    const updated = await transaction(async tx => {
+      const locked = await lockedAccount(tx, verified, tokenHash);
+      if (change === "username") {
+        const normalized = (username as string).toLowerCase();
+        if (locked.username === normalized) return { id: locked.id, username: locked.username };
+        const [changed] = await tx<User>("UPDATE users SET username = $2 WHERE id = $1 AND password_hash = $3 RETURNING id::text, username", [locked.id, normalized, verified.password_hash]);
+        if (!changed) throw new ApiError(409, "Данные аккаунта уже изменились. Повторите действие.");
+        await tx(`INSERT INTO audit_events (user_id, action, details) VALUES ($1, 'user.username_changed',
+          jsonb_build_object('before', jsonb_build_object('username', $2::text), 'after', jsonb_build_object('username', $3::text)))`, [locked.id, locked.username, normalized]);
+        return changed;
+      }
+      const changed = await tx<{ id: string }>("UPDATE users SET password_hash = $2 WHERE id = $1 AND password_hash = $3 RETURNING id::text", [locked.id, newHash, verified.password_hash]);
+      if (!changed.length) throw new ApiError(409, "Данные аккаунта уже изменились. Повторите действие.");
+      await tx("DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", [locked.id, tokenHash]);
+      await tx("INSERT INTO audit_events (user_id, action) VALUES ($1, 'user.password_changed')", [locked.id]);
+      return null;
+    });
+    return json(change === "username" ? { user: updated } : { ok: true });
+  } catch (error) {
+    if (error instanceof DatabaseError && error.code === "23505") throw new ApiError(409, "Этот логин уже занят.");
+    throw error;
+  }
 }
 
 function taskColumns(alias = ""): string {
@@ -232,6 +300,7 @@ async function deleteTask(user: User, id: string): Promise<Response> {
 
 const auditActions = new Set([
   "user.registered", "user.logged_in", "user.logged_out",
+  "user.username_changed", "user.password_changed",
   "task.created", "task.updated", "task.completed", "task.cancelled", "task.reopened", "task.deleted",
 ]);
 
@@ -284,6 +353,8 @@ export async function handleApi(request: Request): Promise<Response> {
       return json({ ok: true }, 200, { "Set-Cookie": sessionCookie(request, "", true) });
     }
     const user = await requireUser(request);
+    if (path === "/api/account/username" && request.method === "PATCH") return await updateAccount(request, user, "username");
+    if (path === "/api/account/password" && request.method === "PATCH") return await updateAccount(request, user, "password");
     if (path === "/api/tasks" && request.method === "GET") {
       return json({ tasks: await query<Task>(`SELECT ${taskColumns()} FROM tasks WHERE user_id = $1 ORDER BY created_at DESC, id DESC`, [user.id]) });
     }

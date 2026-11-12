@@ -9,6 +9,7 @@ const base = new URL(process.env.TEST_BASE_URL ?? 'http://127.0.0.1:3000').origi
 const output = await mkdtemp(path.join(tmpdir(), 'crimson-browser-'));
 const username = `qa_ui_${randomBytes(7).toString('hex')}`;
 const password = randomBytes(2).toString('hex');
+const secrets = [password];
 const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, timezoneId: 'Europe/Moscow' });
 const page = await context.newPage();
@@ -63,7 +64,16 @@ async function noHorizontalOverflow() {
   const geometry = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, width: document.documentElement.clientWidth }));
   assert.ok(geometry.scroll <= geometry.width + 1, `Page has no horizontal overflow (${geometry.scroll}/${geometry.width})`);
 }
-async function screenshot(name) { await page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true }); }
+async function screenshot(name) { await page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true, animations: 'disabled' }); }
+async function login(loginName, loginPassword, status) {
+  await page.getByLabel('Логин', { exact: true }).fill(loginName);
+  await page.getByLabel('Пароль', { exact: true }).fill(loginPassword);
+  const pending = page.waitForResponse(response => response.url() === `${base}/api/auth/login` && response.request().method() === 'POST');
+  await page.locator('.auth-form').getByRole('button', { name: 'Открыть дневник' }).click();
+  assert.equal((await pending).status(), status);
+  if (status === 200) await page.getByRole('button', { name: 'Новая задача', exact: true }).waitFor();
+  else await page.locator('.auth-form').getByRole('alert').waitFor();
+}
 
 try {
   await page.goto(base, { waitUntil: 'networkidle' });
@@ -262,6 +272,102 @@ try {
     }
   });
 
+  const updatedUsername = `${username}_new`;
+  let updatedPassword = randomBytes(2).toString('hex');
+  while (updatedPassword === password) updatedPassword = randomBytes(2).toString('hex');
+  secrets.push(updatedPassword, `${updatedPassword}0`, `${password}wrong`);
+  const originalUser = (await api('/session')).user;
+
+  await check('account rename requires the current password and preserves search and tasks', async () => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole('button', { name: 'Мои задачи', exact: false }).first().click();
+    await page.getByRole('textbox', { name: 'Поиск задач' }).fill('новое имя'); await rows(1);
+    const logout = page.getByRole('button', { name: 'Выйти из аккаунта', exact: true });
+    assert.equal((await logout.innerText()).trim(), 'Выйти');
+    await page.getByRole('button', { name: 'Настройки аккаунта', exact: true }).click();
+    await page.locator('#account-username').fill(updatedUsername);
+    await page.locator('#account-current-password').fill(`${password}wrong`);
+    await page.getByRole('button', { name: 'Сохранить логин', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Текущий пароль неверен.' }).waitFor();
+    assert.equal((await api('/session')).user.id, originalUser.id);
+    assert.equal((await api('/session')).user.username, username);
+    assert.ok(await page.locator('dialog.modal').isVisible());
+    await page.locator('#account-current-password').fill(password);
+    await page.getByRole('button', { name: 'Сохранить логин', exact: true }).click();
+    await page.locator('.success-box').filter({ hasText: 'Логин изменён' }).waitFor();
+    assert.equal(await page.locator('#account-current-password').inputValue(), '');
+    assert.equal((await api('/session')).user.id, originalUser.id);
+    assert.equal((await api('/session')).user.username, updatedUsername);
+    await boundedModal(); await screenshot('account-desktop');
+    await closeDialog();
+    assert.equal(await page.locator('.profile-details strong').innerText(), updatedUsername);
+    await page.reload({ waitUntil: 'networkidle' }); await rows(1);
+    assert.equal(await page.getByRole('textbox', { name: 'Поиск задач' }).inputValue(), 'новое имя');
+    assert.equal((await api('/tasks')).tasks.length, 6);
+    assert.equal(await page.locator('.task-title').innerText(), xssTitle);
+  });
+
+  await check('password confirmation prevents mistakes and a new four-character password keeps the session', async () => {
+    await page.getByRole('button', { name: 'Настройки аккаунта', exact: true }).click();
+    await page.locator('.account-tabs').getByRole('button', { name: 'Пароль', exact: true }).click();
+    await page.locator('#account-current-password').fill(password);
+    await page.locator('#account-new-password').fill(updatedPassword);
+    await page.locator('#account-confirm-password').fill(`${updatedPassword}0`);
+    let passwordRequests = 0;
+    const countPasswordRequest = request => { if (request.url() === `${base}/api/account/password`) passwordRequests++; };
+    page.on('request', countPasswordRequest);
+    await page.getByRole('button', { name: 'Сменить пароль', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Новый пароль и его повтор не совпадают.' }).waitFor();
+    assert.equal(passwordRequests, 0);
+    page.off('request', countPasswordRequest);
+    await page.locator('#account-confirm-password').fill(updatedPassword);
+    await page.getByRole('button', { name: 'Сменить пароль', exact: true }).click();
+    await page.locator('.success-box').filter({ hasText: 'Пароль изменён' }).waitFor();
+    for (const id of ['account-current-password', 'account-new-password', 'account-confirm-password']) assert.equal(await page.locator(`#${id}`).inputValue(), '');
+    assert.equal((await api('/session')).user.id, originalUser.id);
+    assert.equal((await api('/tasks')).tasks.length, 6);
+    await closeDialog();
+    for (const width of [390, 320]) {
+      await page.setViewportSize({ width, height: width === 320 ? 568 : 844 });
+      await noHorizontalOverflow();
+      const profile = page.locator('.profile');
+      assert.equal(await profile.locator('.profile-details strong').innerText(), updatedUsername);
+      assert.ok(await profile.getByRole('button', { name: 'Настройки аккаунта', exact: true }).isVisible());
+      assert.equal((await profile.getByRole('button', { name: 'Выйти из аккаунта', exact: true }).innerText()).trim(), 'Выйти');
+      await page.evaluate(() => scrollTo(0, 0));
+      await page.screenshot({ path: path.join(output, `account-profile-${width}.png`), animations: 'disabled' });
+      await page.getByRole('button', { name: 'Настройки аккаунта', exact: true }).click();
+      await page.locator('.account-tabs').getByRole('button', { name: 'Пароль', exact: true }).click();
+      await boundedModal();
+      await page.screenshot({ path: path.join(output, `account-settings-${width}.png`), animations: 'disabled' });
+      await closeDialog();
+    }
+  });
+
+  await check('account changes are filterable in the history and new credentials work after logout', async () => {
+    await page.getByRole('button', { name: 'История действий', exact: true }).click();
+    for (const [action, label] of [['user.username_changed', 'Изменён логин'], ['user.password_changed', 'Изменён пароль']]) {
+      const events = (await api(`/audit?action=${action}`)).events;
+      assert.equal(events.length, 1);
+      await page.locator('.history-section .filter-trigger').click();
+      await select('history-action', label);
+      await applyFilters();
+      await page.waitForFunction(expected => document.querySelectorAll('.audit-content h3').length === 1 && document.querySelector('.audit-content h3').textContent === expected, label);
+      await noHorizontalOverflow();
+    }
+    await page.getByRole('button', { name: 'Выйти из аккаунта', exact: true }).click();
+    await page.locator('.auth-form').waitFor(); authenticated = false;
+    assert.equal((await api('/session')).user, null);
+    await login(username, password, 401);
+    await login(updatedUsername, password, 401);
+    await login(updatedUsername, updatedPassword, 200); authenticated = true;
+    await rows(1);
+    assert.equal((await api('/session')).user.id, originalUser.id);
+    assert.equal(await page.getByRole('textbox', { name: 'Поиск задач' }).inputValue(), 'новое имя');
+    assert.equal(await page.locator('.task-title').innerText(), xssTitle);
+    await page.getByRole('button', { name: 'Очистить поиск', exact: true }).click(); await rows(6);
+  });
+
   await check('deletion keeps the audit and logout revokes the session', async () => {
     await page.getByRole('button', { name: 'Мои задачи', exact: false }).first().click();
     await page.getByRole('button', { name: `Удалить: ${xssTitle}`, exact: true }).click();
@@ -279,7 +385,7 @@ try {
   console.log(`PASS: ${checks.length} browser scenarios. Artifacts: ${output}`);
 } catch (error) {
   await screenshot('failure').catch(() => {});
-  console.error(String(error?.stack ?? error).replaceAll(password, '[redacted]'));
+  console.error(secrets.reduce((message, secret) => message.replaceAll(secret, '[redacted]'), String(error?.stack ?? error)));
   console.error(`Artifacts: ${output}`);
   process.exitCode = 1;
 } finally {

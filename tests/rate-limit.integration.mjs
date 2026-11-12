@@ -9,7 +9,7 @@ const userKeys = usernames.map((username) => hash(`auth-user:${username}`));
 const globalKey = hash('auth-instance:local');
 const staleKey = hash(`auth-user:qa_stale_${suffix}`);
 const password = randomBytes(24).toString('base64url');
-const base = 'http://127.0.0.1:3000';
+const base = `http://127.0.0.1:${process.env.PORT ?? '3000'}`;
 const client = new pg.Client({
   connectionString: process.env.DATABASE_URL,
   connectionTimeoutMillis: 5000,

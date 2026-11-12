@@ -24,6 +24,13 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
   let cookie;
   let otherCookie;
   let taskId;
+  let accountCookie;
+  let accountId;
+  let accountTaskId;
+  let otherAccountCookie;
+  const accountUsername = `qa_account_${suffix}`;
+  const renamedUsername = randomBytes(3).toString("base64url").toLowerCase();
+  const changedPassword = randomBytes(3).toString("base64url");
   const originalTitle = '<script>alert("task")</script>';
 
   await t.test("database ready and anonymous access denied", async () => {
@@ -247,5 +254,91 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
       assert.equal((await request("/api/auth/login", { method: "POST", body: { username: unknown, password } })).status, 401);
     }
     assert.equal((await request("/api/auth/login", { method: "POST", body: { username: unknown, password } })).status, 429);
+  });
+
+  await t.test("account settings require a session, current password and exact fields", async () => {
+    const registration = await request("/api/auth/register", { method: "POST", body: { username: accountUsername, password } });
+    assert.equal(registration.status, 201, registration.data.error);
+    accountCookie = registration.cookie.split(";")[0];
+    accountId = registration.data.user.id;
+    const task = await request("/api/tasks", { method: "POST", cookie: accountCookie, body: { title: "Задача остаётся при изменении аккаунта" } });
+    assert.equal(task.status, 201, task.data.error);
+    accountTaskId = task.data.task.id;
+    for (const [path, body] of [
+      ["/api/account/username", { username: renamedUsername, currentPassword: password }],
+      ["/api/account/password", { currentPassword: password, newPassword: changedPassword }],
+    ]) {
+      assert.equal((await request(path, { method: "PATCH", body })).status, 401);
+      assert.equal((await request(path, { method: "PATCH", cookie: accountCookie, customOrigin: "https://attacker.invalid", body })).status, 403);
+      assert.equal((await request(path, { method: "PATCH", cookie: accountCookie, body: { ...body, userId: "someone-else" } })).status, 400);
+      assert.equal((await request(path, { method: "PATCH", cookie: accountCookie, body: { ...body, currentPassword: "wrong-password" } })).status, 400);
+    }
+    for (const [path, body] of [
+      ["/api/account/username", { username: "abc", currentPassword: password }],
+      ["/api/account/password", { currentPassword: password, newPassword: "abc" }],
+      ["/api/account/password", { currentPassword: "", newPassword: changedPassword }],
+    ]) {
+      assert.equal((await request(path, { method: "PATCH", cookie: accountCookie, body })).status, 400);
+    }
+    assert.equal((await request("/api/session", { cookie: accountCookie })).data.user.id, accountId);
+    assert.deepEqual((await request("/api/audit?action=user.password_changed", { cookie: accountCookie })).data.events, []);
+    const collision = await request("/api/account/username", { method: "PATCH", cookie: accountCookie, body: { username: otherUsername, currentPassword: password } });
+    assert.equal(collision.status, 409);
+    assert.equal((await request("/api/session", { cookie: accountCookie })).data.user.username, accountUsername);
+  });
+
+  await t.test("username changes preserve user ID, tasks and sessions with accurate audit", async () => {
+    const unchanged = await request("/api/account/username", { method: "PATCH", cookie: accountCookie, body: { username: accountUsername, currentPassword: password } });
+    assert.equal(unchanged.status, 200, unchanged.data.error);
+    assert.deepEqual((await request("/api/audit?action=user.username_changed", { cookie: accountCookie })).data.events, []);
+    assert.equal(renamedUsername.length, 4);
+    const renamed = await request("/api/account/username", { method: "PATCH", cookie: accountCookie, body: { username: renamedUsername.toUpperCase(), currentPassword: password } });
+    assert.equal(renamed.status, 200, renamed.data.error);
+    assert.deepEqual(renamed.data.user, { id: accountId, username: renamedUsername });
+    assert.deepEqual((await request("/api/session", { cookie: accountCookie })).data.user, renamed.data.user);
+    assert.equal((await request(`/api/tasks/${accountTaskId}`, { cookie: accountCookie })).data.task.id, accountTaskId);
+    const events = (await request("/api/audit?action=user.username_changed", { cookie: accountCookie })).data.events;
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].details, { before: { username: accountUsername }, after: { username: renamedUsername } });
+    assert.equal((await request("/api/auth/login", { method: "POST", body: { username: accountUsername, password } })).status, 401);
+    const secondLogin = await request("/api/auth/login", { method: "POST", body: { username: renamedUsername, password } });
+    assert.equal(secondLogin.status, 200, secondLogin.data.error);
+    otherAccountCookie = secondLogin.cookie.split(";")[0];
+  });
+
+  await t.test("password change revokes other and racing old-password sessions, keeping the current session", async () => {
+    assert.equal(changedPassword.length, 4);
+    const [racingLogin, changed] = await Promise.all([
+      request("/api/auth/login", { method: "POST", body: { username: renamedUsername, password } }),
+      request("/api/account/password", { method: "PATCH", cookie: accountCookie, body: { currentPassword: password, newPassword: changedPassword } }),
+    ]);
+    assert.equal(changed.status, 200, changed.data.error);
+    assert.deepEqual(changed.data, { ok: true });
+    assert.ok([200, 401].includes(racingLogin.status));
+    if (racingLogin.status === 200) {
+      assert.equal((await request("/api/tasks", { cookie: racingLogin.cookie.split(";")[0] })).status, 401);
+    }
+    assert.equal((await request("/api/tasks", { cookie: otherAccountCookie })).status, 401);
+    assert.equal((await request("/api/tasks", { cookie: accountCookie })).status, 200);
+    assert.equal((await request(`/api/tasks/${accountTaskId}`, { cookie: accountCookie })).data.task.id, accountTaskId);
+    assert.equal((await request("/api/auth/login", { method: "POST", body: { username: renamedUsername, password } })).status, 401);
+    const newLogin = await request("/api/auth/login", { method: "POST", body: { username: renamedUsername, password: changedPassword } });
+    assert.equal(newLogin.status, 200, newLogin.data.error);
+    assert.equal(newLogin.data.user.id, accountId);
+    const events = (await request("/api/audit?action=user.password_changed", { cookie: accountCookie })).data.events;
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].details, {});
+    assert.equal(events[0].taskId, null);
+    assert.equal(events[0].taskTitle, null);
+    assert.ok(!JSON.stringify(events).includes("password_hash"));
+    // Six earlier settings attempts must keep the same budget across both credential changes.
+    for (let index = 0; index < 6; index++) {
+      assert.equal((await request("/api/account/password", { method: "PATCH", cookie: accountCookie, body: { currentPassword: "wrong-password", newPassword: changedPassword } })).status, 400);
+    }
+    assert.equal((await request("/api/account/username", { method: "PATCH", cookie: accountCookie, body: { currentPassword: changedPassword, username: accountUsername } })).status, 429);
+    assert.equal((await request("/api/session", { cookie: accountCookie })).data.user.username, renamedUsername);
+    await request(`/api/tasks/${accountTaskId}`, { method: "DELETE", cookie: accountCookie });
+    await request("/api/auth/logout", { method: "POST", cookie: accountCookie });
+    await request("/api/auth/logout", { method: "POST", cookie: newLogin.cookie.split(";")[0] });
   });
 });

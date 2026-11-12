@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { ArrowRight, Ban, BookOpen, CalendarDays, Check, CheckCheck, ChevronDown, Circle, Flag, History, LayoutList, Loader2, LogOut, Pencil, Plus, RotateCcw, Search, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { ArrowRight, Ban, BookOpen, CalendarDays, Check, CheckCheck, ChevronDown, Circle, Flag, History, LayoutList, Loader2, LogOut, Pencil, Plus, RotateCcw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { DatePicker, SelectField } from "./components/controls";
 import { capitalizeLines, dateKey, emptyFilters, filterTasks, localDateBoundary, matchesSearch, normalizeSearch, parsePreferences, type Priority, type TaskFilters, type TaskPreferences, type TaskStatus } from "@/lib/client/task-filters";
 
@@ -207,16 +207,74 @@ function DeleteDialog({ task, onDelete, onClose }: { task: Task; onDelete: () =>
   return <Modal title="Удалить задачу?" busy={busy} onClose={onClose}><p className="delete-description">«{task.title}» будет удалена из списка. Это действие останется в истории.</p>{error && <p role="alert" className="error-box">{error}</p>}<div className="modal-actions"><button className="button secondary" disabled={busy} onClick={onClose}>Оставить</button><button className="button primary" disabled={busy} onClick={remove}>{busy ? <Loader2 className="spin" size={17} /> : <Trash2 size={17} />}Удалить</button></div></Modal>;
 }
 
+function AccountSettings({ user, onUserChanged, onSaved, onUnauthorized, onClose }: { user: User; onUserChanged: (user: User) => void; onSaved: () => void; onUnauthorized: () => void; onClose: () => void }) {
+  const [mode, setMode] = useState<"username" | "password">("username");
+  const [username, setUsername] = useState(user.username);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  function chooseMode(next: typeof mode) {
+    setMode(next); setError(""); setSuccess(""); setCurrentPassword(""); setNewPassword(""); setConfirmation("");
+  }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(""); setSuccess("");
+    if (currentPassword.length < 4 || currentPassword.length > 128) { setError("Введите текущий пароль: от 4 до 128 символов."); return; }
+    const nextUsername = username.trim();
+    if (mode === "username" && !/^[A-Za-z0-9_.-]{4,32}$/.test(nextUsername)) { setError("Новый логин: от 4 до 32 латинских букв, цифр или знаков _ . -"); return; }
+    if (mode === "password" && (newPassword.length < 4 || newPassword.length > 128)) { setError("Новый пароль должен содержать от 4 до 128 символов."); return; }
+    if (mode === "password" && newPassword !== confirmation) { setError("Новый пароль и его повтор не совпадают."); return; }
+    setBusy(true);
+    try {
+      if (mode === "username") {
+        const result = await api<{ user: User }>("/account/username", "PATCH", { username: nextUsername, currentPassword });
+        onUserChanged(result.user); setUsername(result.user.username); setSuccess("Логин изменён. Ваши задачи и история сохранены.");
+      } else {
+        await api<{ ok: boolean }>("/account/password", "PATCH", { currentPassword, newPassword });
+        setNewPassword(""); setConfirmation(""); setSuccess("Пароль изменён. На остальных устройствах потребуется войти заново.");
+      }
+      setCurrentPassword("");
+      onSaved();
+    } catch (failure) {
+      if (failure instanceof ApiError && failure.status === 401) onUnauthorized(); else setError(errorMessage(failure));
+    } finally { setBusy(false); }
+  }
+  return <Modal title="Настройки аккаунта" busy={busy} onClose={onClose}>
+    <p className="account-intro">Измените данные для входа. Для подтверждения понадобится текущий пароль.</p>
+    <div className="auth-tabs account-tabs" aria-label="Настройки данных для входа">
+      <button type="button" className={mode === "username" ? "active" : ""} aria-pressed={mode === "username"} disabled={busy} onClick={() => chooseMode("username")}>Логин</button>
+      <button type="button" className={mode === "password" ? "active" : ""} aria-pressed={mode === "password"} disabled={busy} onClick={() => chooseMode("password")}>Пароль</button>
+    </div>
+    <form className="task-form account-form" noValidate onSubmit={submit}>
+      {mode === "username" ? <>
+        <label htmlFor="account-username">Новый логин<input id="account-username" name="username" value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" autoCapitalize="none" spellCheck={false} minLength={4} maxLength={32} data-initial-focus disabled={busy} /></label>
+        <p className="field-help">4–32 символа: латинские буквы, цифры и знаки _ . -</p>
+      </> : <input type="hidden" name="username" value={user.username} autoComplete="username" />}
+      <label htmlFor="account-current-password">Текущий пароль<input id="account-current-password" name="currentPassword" type="password" value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} autoComplete="current-password" minLength={4} maxLength={128} disabled={busy} /></label>
+      {mode === "password" && <>
+        <label htmlFor="account-new-password">Новый пароль<input id="account-new-password" name="newPassword" type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} placeholder="Не менее 4 символов" autoComplete="new-password" minLength={4} maxLength={128} disabled={busy} /></label>
+        <label htmlFor="account-confirm-password">Повторите новый пароль<input id="account-confirm-password" name="confirmPassword" type="password" value={confirmation} onChange={event => setConfirmation(event.target.value)} autoComplete="new-password" minLength={4} maxLength={128} disabled={busy} /></label>
+      </>}
+      {error && <p className="error-box" role="alert">{error}</p>}
+      {success && <p className="success-box" role="status"><Check size={18} />{success}</p>}
+      <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>Закрыть</button><button className="button primary" disabled={busy}>{busy ? <Loader2 size={18} className="spin" /> : <Check size={18} />}{mode === "username" ? "Сохранить логин" : "Сменить пароль"}</button></div>
+    </form>
+  </Modal>;
+}
+
 const auditLabels: Record<string, string> = {
   "task.created": "Добавлена задача", "task.updated": "Задача отредактирована", "task.completed": "Задача выполнена", "task.cancelled": "Задача отменена", "task.reopened": "Задача возвращена в работу", "task.deleted": "Задача удалена",
   "auth.register": "Создан аккаунт", "auth.login": "Вход в дневник", "auth.logout": "Выход из дневника",
   "user.registered": "Создан аккаунт", "user.logged_in": "Вход в дневник", "user.logged_out": "Выход из дневника",
+  "user.username_changed": "Изменён логин", "user.password_changed": "Изменён пароль",
 };
 const auditOptions = [
   { value: "", label: "Все действия" },
-  ...["task.created", "task.updated", "task.completed", "task.cancelled", "task.reopened", "task.deleted", "user.registered", "user.logged_in", "user.logged_out"].map(value => ({ value, label: auditLabels[value] })),
+  ...["task.created", "task.updated", "task.completed", "task.cancelled", "task.reopened", "task.deleted", "user.registered", "user.logged_in", "user.logged_out", "user.username_changed", "user.password_changed"].map(value => ({ value, label: auditLabels[value] })),
 ];
-const fieldLabels: Record<string, string> = { title: "Название", description: "Заметка", priority: "Приоритет", dueDate: "Срок", due_date: "Срок" };
+const fieldLabels: Record<string, string> = { title: "Название", description: "Заметка", priority: "Приоритет", dueDate: "Срок", due_date: "Срок", username: "Логин" };
 function displayValue(key: string, value: unknown): string {
   if (value === null || value === "" || value === undefined) return "не задано";
   if (key === "priority" && typeof value === "string" && value in priorityLabels) return priorityLabels[value as Priority];
@@ -262,7 +320,7 @@ function HistoryFilterDialog({ filters, onApply, onClose }: { filters: HistoryFi
   </Modal>;
 }
 
-function HistoryView({ onUnauthorized }: { onUnauthorized: () => void }) {
+function HistoryView({ onUnauthorized, revision }: { onUnauthorized: () => void; revision: number }) {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -288,7 +346,7 @@ function HistoryView({ onUnauthorized }: { onUnauthorized: () => void }) {
       if (currentRequest !== requestId.current) return;
       if (failure instanceof ApiError && failure.status === 401) onUnauthorized(); else setError(errorMessage(failure));
     } finally { if (currentRequest === requestId.current) setLoading(false); }
-  }, [filters, onUnauthorized]);
+  }, [filters, onUnauthorized, revision]);
   useEffect(() => { void load(); return () => { requestId.current++; }; }, [load]);
   return <section className="history-section" aria-label="История действий">
     <div className="list-heading"><h2>Хроника вашего дневника</h2><button className="button secondary filter-trigger" onClick={() => setFilterOpen(true)}><SlidersHorizontal size={18} />Фильтр{count > 0 && <span>{count}</span>}</button></div>
@@ -311,12 +369,14 @@ function savedPreferences(userId: string): TaskPreferences {
   catch { return parsePreferences(null); }
 }
 
-function Workspace({ user, onLogout }: { user: User; onLogout: () => void }) {
+function Workspace({ user, onLogout, onUserChanged }: { user: User; onLogout: () => void; onUserChanged: (user: User) => void }) {
   const [view, setView] = useState<"tasks" | "history">("tasks");
   const [preferences, setPreferences] = useState<TaskPreferences>(() => savedPreferences(user.id));
   const { query, filters, pinnedIds } = preferences;
   const searching = Boolean(normalizeSearch(query));
   const [filterOpen, setFilterOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -397,7 +457,13 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => void }) {
         <button className={view === "history" ? "selected" : ""} onClick={() => setView("history")}><History size={20} strokeWidth={1.5} /><span>История действий</span></button>
       </nav>
       <div className="sidebar-note"><BookOpen size={22} strokeWidth={1.2} /><p>Каждый большой результат<br />начинается с маленького<br /><em>«сделано».</em></p><span>ОДНА ЗАДАЧА ЗА РАЗ</span></div>
-      <div className="profile"><span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span><div><strong>{user.username}</strong><span>Личный аккаунт</span></div><button className="icon-button" aria-label="Выйти из аккаунта" onClick={logout} disabled={loggingOut}>{loggingOut ? <Loader2 size={18} className="spin" /> : <LogOut size={18} />}</button></div>
+      <div className="profile">
+        <div className="profile-identity"><span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span><div className="profile-details"><strong>{user.username}</strong><span>Личный аккаунт</span></div></div>
+        <div className="profile-actions">
+          <button className="profile-action" aria-label="Настройки аккаунта" onClick={() => setAccountOpen(true)} disabled={loggingOut}><Settings size={18} /><span>Аккаунт</span></button>
+          <button className="profile-action profile-logout" aria-label="Выйти из аккаунта" onClick={logout} disabled={loggingOut}>{loggingOut ? <Loader2 size={18} className="spin" /> : <LogOut size={18} />}<span>Выйти</span></button>
+        </div>
+      </div>
     </aside>
     <div className="main-shell">
       <header className="topbar"><div><span className="breadcrumb">Дневник</span><span className="breadcrumb-divider">/</span><span>{view === "tasks" ? "Мои задачи" : "История действий"}</span></div><span className="topbar-date"><CalendarDays size={17} strokeWidth={1.5} />{formatDate(new Date().toISOString(), true)}</span></header>
@@ -443,7 +509,7 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => void }) {
             <div className="list-footer"><span><ShieldCheck size={15} />Ваши задачи доступны только вам</span><span>Показано {visible.length} из {tasks.length}</span></div>
           </section>
           <div className="bottom-note"><span className="note-line" /><BookOpen size={19} strokeWidth={1.2} /><span>Не всё сразу. Главное — начать.</span><span className="note-line" /></div>
-        </> : <HistoryView onUnauthorized={onLogout} />}
+        </> : <HistoryView onUnauthorized={onLogout} revision={historyRevision} />}
       </main>
       <footer className="workspace-footer"><span>ORDO <span className="footer-dot">·</span> Личный дневник дел</span><span>Упорядочивая день, создаём будущее.</span></footer>
     </div>
@@ -451,6 +517,7 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => void }) {
     {editor !== null && <TaskEditor task={editor === "new" ? null : editor} onSave={saveTask} onClose={() => setEditor(null)} />}
     {deleting && <DeleteDialog task={deleting} onDelete={deleteTask} onClose={() => setDeleting(null)} />}
     {filterOpen && <TaskFilterDialog filters={filters} onApply={setFilters} onClose={() => setFilterOpen(false)} />}
+    {accountOpen && <AccountSettings user={user} onUserChanged={onUserChanged} onSaved={() => setHistoryRevision(previous => previous + 1)} onUnauthorized={onLogout} onClose={() => setAccountOpen(false)} />}
   </div>;
 }
 
@@ -466,5 +533,5 @@ export default function Home() {
   useEffect(() => { void load(); }, [load]);
   if (loading) return <main className="initial-state"><Brand /><Loader2 className="spin" size={22} /><p>Открываем дневник…</p></main>;
   if (error) return <main className="initial-state"><Brand /><h1>Не удалось открыть дневник</h1><p role="alert">{error}</p><button className="button primary" onClick={() => void load()}>Попробовать снова<ArrowRight size={17} /></button></main>;
-  return user ? <Workspace key={user.id} user={user} onLogout={logout} /> : <AuthScreen onAuthenticated={setUser} />;
+  return user ? <Workspace key={user.id} user={user} onLogout={logout} onUserChanged={setUser} /> : <AuthScreen onAuthenticated={setUser} />;
 }
