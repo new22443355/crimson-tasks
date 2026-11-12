@@ -65,15 +65,18 @@ function credentials(body: Record<string, unknown>): { username: string; passwor
   return { username: body.username.toLowerCase(), password: body.password };
 }
 
-async function throttle(request: Request, username: string): Promise<void> {
-  const ip = request.headers.get("cf-connecting-ip") ?? "local-preview";
-  for (const [key, limit] of [[`auth-user:${username}`, 12], [`auth-ip:${ip}`, 60]] as const) {
+async function throttle(username: string): Promise<void> {
+  await query(`DELETE FROM auth_rate_limits WHERE key IN (
+    SELECT key FROM auth_rate_limits WHERE window_start < now() - interval '15 minutes'
+    ORDER BY window_start LIMIT 100
+  ) AND window_start < now() - interval '15 minutes'`);
+  for (const [key, limit] of [["auth-instance:local", 60], [`auth-user:${username}`, 12]] as const) {
     const rows = await query<{ attempts: number }>(`
       INSERT INTO auth_rate_limits (key, attempts, window_start) VALUES ($1, 1, now())
       ON CONFLICT (key) DO UPDATE SET
-        attempts = CASE WHEN auth_rate_limits.window_start < now() - interval '15 minutes' THEN 1 ELSE auth_rate_limits.attempts + 1 END,
+        attempts = CASE WHEN auth_rate_limits.window_start < now() - interval '15 minutes' THEN 1 ELSE LEAST(auth_rate_limits.attempts, $2) + 1 END,
         window_start = CASE WHEN auth_rate_limits.window_start < now() - interval '15 minutes' THEN now() ELSE auth_rate_limits.window_start END
-      RETURNING attempts`, [await digest(key)]);
+      RETURNING attempts`, [await digest(key), limit]);
     if (rows[0].attempts > limit) throw new ApiError(429, "Слишком много попыток. Попробуйте через 15 минут.");
   }
 }
@@ -94,7 +97,7 @@ async function requireUser(request: Request): Promise<User> {
 
 async function authenticate(request: Request, register: boolean): Promise<Response> {
   const { username, password } = credentials(await readBody(request));
-  await throttle(request, username);
+  await throttle(username);
   const token = randomToken();
   const tokenHash = await digest(token);
   const expires = new Date(Date.now() + SESSION_AGE * 1000).toISOString();

@@ -56,3 +56,4 @@ CREATE TABLE IF NOT EXISTS auth_rate_limits (
   attempts integer NOT NULL DEFAULT 1,
   window_start timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+CREATE INDEX IF NOT EXISTS auth_rate_window_idx ON auth_rate_limits(window_start);
