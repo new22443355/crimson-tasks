@@ -11,6 +11,8 @@
     "start": "node scripts/start-local.mjs",
     "typecheck": "tsc --noEmit",
     "test:integration": "node tests/api.integration.mjs",
+    "test:filters": "node --experimental-strip-types --test tests/task-filters.test.mjs",
+    "test:browser": "node tests/browser.integration.mjs",
     "test:security": "node scripts/test-security.mjs",
     "db:migrate": "node --env-file=.env.local scripts/migrate.mjs",
     "local:up": "node scripts/local.mjs up",
@@ -31,6 +33,7 @@
     "@types/pg": "8.20.0",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "playwright": "1.65.0",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3"
   },

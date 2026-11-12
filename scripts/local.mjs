@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { ensureLocalEnvironment, projectRoot } from './setup-local.mjs';
+import { migrateLocalDatabase } from './migrate-local.mjs';
 
 const commands = {
   up: ['up', '--build', '--detach', '--wait', '--wait-timeout', '180'],
@@ -41,6 +42,11 @@ try {
   }
   const { created } = await ensureLocalEnvironment();
   if (created) console.log('Создан .env.docker со случайными паролями. Файл исключён из Git.');
+  if (action === 'up') {
+    const database = docker(['compose', '--project-name', 'crimson-tasks-local', '--file', 'compose.yaml', '--env-file', '.env.docker', 'up', '--detach', '--wait', '--wait-timeout', '180', 'db']);
+    if (database.status !== 0) throw new Error('Не удалось подготовить PostgreSQL к запуску.');
+    await migrateLocalDatabase();
+  }
   const result = docker(['compose', '--project-name', 'crimson-tasks-local', '--file', 'compose.yaml', '--env-file', '.env.docker', ...commands[action]]);
   if (result.status !== 0) {
     process.exitCode = result.status ?? 1;

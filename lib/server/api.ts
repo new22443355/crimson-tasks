@@ -4,9 +4,9 @@ import { digest, hashPassword, randomToken, sessionCookie, sessionToken, SESSION
 type User = { id: string; username: string };
 type Task = {
   id: string; title: string; description: string; priority: "low" | "normal" | "high";
-  dueDate: string | null; completed: boolean; createdAt: string; updatedAt: string;
+  dueDate: string | null; completed: boolean; cancelled: boolean; createdAt: string; updatedAt: string;
 };
-type TaskInput = Pick<Task, "title" | "description" | "priority" | "dueDate" | "completed">;
+type TaskInput = Pick<Task, "title" | "description" | "priority" | "dueDate" | "completed" | "cancelled">;
 type AuditEvent = { id: string; action: string; taskId: string | null; taskTitle: string | null; createdAt: string; details: unknown };
 
 class ApiError extends Error {
@@ -55,12 +55,13 @@ async function readBody(request: Request): Promise<Record<string, unknown>> {
   return data as Record<string, unknown>;
 }
 
-function credentials(body: Record<string, unknown>): { username: string; password: string } {
-  if (typeof body.username !== "string" || !/^[a-zA-Z0-9_.-]{3,32}$/.test(body.username)) {
-    throw new ApiError(400, "Логин: 3–32 символа, латинские буквы, цифры, точка, дефис или подчёркивание.");
+function credentials(body: Record<string, unknown>, register: boolean): { username: string; password: string } {
+  const usernamePattern = register ? /^[a-zA-Z0-9_.-]{4,32}$/ : /^[a-zA-Z0-9_.-]{3,32}$/;
+  if (typeof body.username !== "string" || !usernamePattern.test(body.username)) {
+    throw new ApiError(400, `Логин: ${register ? 4 : 3}–32 символа, латинские буквы, цифры, точка, дефис или подчёркивание.`);
   }
-  if (typeof body.password !== "string" || body.password.length < 12 || body.password.length > 128) {
-    throw new ApiError(400, "Пароль должен содержать от 12 до 128 символов.");
+  if (typeof body.password !== "string" || body.password.length < 4 || body.password.length > 128) {
+    throw new ApiError(400, "Пароль должен содержать от 4 до 128 символов.");
   }
   return { username: body.username.toLowerCase(), password: body.password };
 }
@@ -96,7 +97,7 @@ async function requireUser(request: Request): Promise<User> {
 }
 
 async function authenticate(request: Request, register: boolean): Promise<Response> {
-  const { username, password } = credentials(await readBody(request));
+  const { username, password } = credentials(await readBody(request), register);
   await throttle(username);
   const token = randomToken();
   const tokenHash = await digest(token);
@@ -133,17 +134,17 @@ async function authenticate(request: Request, register: boolean): Promise<Respon
 
 function taskColumns(alias = ""): string {
   const p = alias ? `${alias}.` : "";
-  return `${p}id::text, ${p}title, ${p}description, ${p}priority, to_char(${p}due_date, 'YYYY-MM-DD') AS "dueDate", ${p}completed,
+  return `${p}id::text, ${p}title, ${p}description, ${p}priority, to_char(${p}due_date, 'YYYY-MM-DD') AS "dueDate", ${p}completed, ${p}cancelled,
     ${p}created_at AS "createdAt", ${p}updated_at AS "updatedAt"`;
 }
 
 function snapshot(alias: string): string {
   return `jsonb_build_object('title', ${alias}.title, 'description', ${alias}.description, 'priority', ${alias}.priority,
-    'dueDate', to_char(${alias}.due_date, 'YYYY-MM-DD'), 'completed', ${alias}.completed)`;
+    'dueDate', to_char(${alias}.due_date, 'YYYY-MM-DD'), 'completed', ${alias}.completed, 'cancelled', ${alias}.cancelled)`;
 }
 
 function taskInput(body: Record<string, unknown>, partial = false): Partial<TaskInput> {
-  const allowed = new Set(["title", "description", "priority", "dueDate", ...(partial ? ["completed"] : [])]);
+  const allowed = new Set(["title", "description", "priority", "dueDate", ...(partial ? ["completed", "cancelled"] : [])]);
   if (Object.keys(body).some((key) => !allowed.has(key))) throw new ApiError(400, "Запрос содержит неизвестные поля.");
   if (!partial && !("title" in body)) throw new ApiError(400, "Введите название задачи.");
   if (partial && !Object.keys(body).length) throw new ApiError(400, "Нет изменений для сохранения.");
@@ -172,6 +173,13 @@ function taskInput(body: Record<string, unknown>, partial = false): Partial<Task
     if (typeof body.completed !== "boolean") throw new ApiError(400, "Некорректный статус задачи.");
     result.completed = body.completed;
   }
+  if ("cancelled" in body) {
+    if (typeof body.cancelled !== "boolean") throw new ApiError(400, "Некорректный статус задачи.");
+    result.cancelled = body.cancelled;
+  }
+  if (result.completed && result.cancelled) throw new ApiError(400, "Задача не может быть одновременно выполнена и отменена.");
+  if (result.completed) result.cancelled = false;
+  if (result.cancelled) result.completed = false;
   return result;
 }
 
@@ -194,17 +202,18 @@ async function updateTask(request: Request, user: User, id: string): Promise<Res
   ), changed AS (
     UPDATE tasks t SET title = COALESCE($3, p.title), description = COALESCE($4, p.description),
       priority = COALESCE($5, p.priority), due_date = CASE WHEN $6::boolean THEN $7::date ELSE p.due_date END,
-      completed = COALESCE($8::boolean, p.completed), updated_at = clock_timestamp()
+      completed = COALESCE($8::boolean, p.completed), cancelled = COALESCE($9::boolean, p.cancelled), updated_at = clock_timestamp()
     FROM previous p WHERE t.id = p.id AND (
       ($3::text IS NOT NULL AND $3 IS DISTINCT FROM p.title) OR ($4::text IS NOT NULL AND $4 IS DISTINCT FROM p.description) OR
       ($5::text IS NOT NULL AND $5 IS DISTINCT FROM p.priority) OR ($6::boolean AND $7::date IS DISTINCT FROM p.due_date) OR
-      ($8::boolean IS NOT NULL AND $8 IS DISTINCT FROM p.completed)
-    ) RETURNING t.*, ${snapshot("p")} AS before, p.completed AS was_completed
+      ($8::boolean IS NOT NULL AND $8 IS DISTINCT FROM p.completed) OR ($9::boolean IS NOT NULL AND $9 IS DISTINCT FROM p.cancelled)
+    ) RETURNING t.*, ${snapshot("p")} AS before, p.completed AS was_completed, p.cancelled AS was_cancelled
   ), event AS (
     INSERT INTO audit_events (user_id, action, task_id, task_title, details)
-    SELECT user_id, CASE WHEN completed IS DISTINCT FROM was_completed THEN CASE WHEN completed THEN 'task.completed' ELSE 'task.reopened' END ELSE 'task.updated' END,
+    SELECT user_id, CASE WHEN completed IS DISTINCT FROM was_completed OR cancelled IS DISTINCT FROM was_cancelled
+      THEN CASE WHEN cancelled THEN 'task.cancelled' WHEN completed THEN 'task.completed' ELSE 'task.reopened' END ELSE 'task.updated' END,
       id, title, jsonb_build_object('before', before, 'after', ${snapshot("changed")}) FROM changed
-  ) SELECT ${taskColumns()} FROM changed`, [id, user.id, input.title ?? null, input.description ?? null, input.priority ?? null, "dueDate" in input, input.dueDate ?? null, input.completed ?? null]);
+  ) SELECT ${taskColumns()} FROM changed`, [id, user.id, input.title ?? null, input.description ?? null, input.priority ?? null, "dueDate" in input, input.dueDate ?? null, input.completed ?? null, input.cancelled ?? null]);
   const task = rows[0] ?? (await query<Task>(`SELECT ${taskColumns()} FROM tasks WHERE id = $1 AND user_id = $2`, [id, user.id]))[0];
   if (!task) throw new ApiError(404, "Задача не найдена.");
   return json({ task });
@@ -221,12 +230,36 @@ async function deleteTask(user: User, id: string): Promise<Response> {
   return json({ ok: true });
 }
 
+const auditActions = new Set([
+  "user.registered", "user.logged_in", "user.logged_out",
+  "task.created", "task.updated", "task.completed", "task.cancelled", "task.reopened", "task.deleted",
+]);
+
+function auditDateBound(value: string | null): string | null {
+  if (value === null) return null;
+  const match = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/);
+  const date = new Date(value);
+  const normalized = match ? `${match[1]}.${(match[2] ?? "").padEnd(3, "0")}Z` : "";
+  if (!match || value.startsWith("0000") || Number.isNaN(date.valueOf()) || date.toISOString() !== normalized) {
+    throw new ApiError(400, "Некорректная дата фильтра истории.");
+  }
+  return normalized;
+}
+
 async function audit(user: User, url: URL): Promise<Response> {
   const before = url.searchParams.get("before");
   if (before && (!/^\d{1,18}$/.test(before) || BigInt(before) <= BigInt(0))) throw new ApiError(400, "Некорректный указатель истории.");
+  const action = url.searchParams.get("action");
+  if (action !== null && !auditActions.has(action)) throw new ApiError(400, "Некорректное действие в фильтре истории.");
+  const from = auditDateBound(url.searchParams.get("from"));
+  const to = auditDateBound(url.searchParams.get("to"));
+  if (from && to && from >= to) throw new ApiError(400, "Начало периода должно быть раньше его окончания.");
   const rows = await query<AuditEvent>(`SELECT id::text, action, task_id::text AS "taskId", task_title AS "taskTitle",
     created_at AS "createdAt", details FROM audit_events WHERE user_id = $1 AND ($2::bigint IS NULL OR id < $2::bigint)
-    ORDER BY audit_events.id DESC LIMIT 51`, [user.id, before ?? null]);
+      AND ($3::text IS NULL OR action = $3)
+      AND ($4::timestamptz IS NULL OR created_at >= $4::timestamptz)
+      AND ($5::timestamptz IS NULL OR created_at < $5::timestamptz)
+    ORDER BY audit_events.id DESC LIMIT 51`, [user.id, before ?? null, action, from, to]);
   const events = rows.slice(0, 50);
   return json({ events, nextCursor: rows.length > 50 ? events[49].id : null });
 }

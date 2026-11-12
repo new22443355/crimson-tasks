@@ -38,7 +38,8 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
 
   await t.test("registration validates credentials and establishes protected session", async () => {
     assert.equal((await request("/api/auth/register", { method: "POST", body: { username: "bad user", password } })).status, 400);
-    assert.equal((await request("/api/auth/register", { method: "POST", body: { username, password: "short" } })).status, 400);
+    assert.equal((await request("/api/auth/register", { method: "POST", body: { username: "abc", password } })).status, 400);
+    assert.equal((await request("/api/auth/register", { method: "POST", body: { username, password: "abc" } })).status, 400);
     const registration = await request("/api/auth/register", { method: "POST", body: { username: username.toUpperCase(), password } });
     assert.equal(registration.status, 201, registration.data.error);
     assert.equal(registration.data.user.username, username);
@@ -53,6 +54,20 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
     const session = await request("/api/session", { cookie });
     assert.equal(session.data.user.username, username);
     assert.deepEqual(Object.keys(session.data.user).sort(), ["id", "username"]);
+  });
+
+  await t.test("four-character username and password can register and log in", async () => {
+    const shortUsername = randomBytes(3).toString("base64url").toLowerCase();
+    const shortPassword = randomBytes(3).toString("base64url");
+    assert.equal(shortUsername.length, 4);
+    assert.equal(shortPassword.length, 4);
+    const registration = await request("/api/auth/register", { method: "POST", body: { username: shortUsername, password: shortPassword } });
+    assert.equal(registration.status, 201, registration.data.error);
+    await request("/api/auth/logout", { method: "POST", cookie: registration.cookie.split(";")[0] });
+    const login = await request("/api/auth/login", { method: "POST", body: { username: shortUsername, password: shortPassword } });
+    assert.equal(login.status, 200, login.data.error);
+    assert.equal(login.data.user.username, shortUsername);
+    await request("/api/auth/logout", { method: "POST", cookie: login.cookie.split(";")[0] });
   });
 
   await t.test("CSRF and input validation reject invalid writes", async () => {
@@ -72,6 +87,7 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
     taskId = result.data.task.id;
     assert.equal(result.data.task.title, originalTitle);
     assert.equal(result.data.task.completed, false);
+    assert.equal(result.data.task.cancelled, false);
     assert.equal(result.data.task.priority, "high");
     assert.equal(result.data.task.dueDate, "2028-02-29");
     const persisted = await request("/api/tasks", { cookie });
@@ -121,6 +137,77 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
     assert.equal(events[1].details.before.title, "Обновлённая задача");
     const task = (await request(`/api/tasks/${taskId}`, { cookie })).data.task;
     assert.equal(task.title, events[0].details.after.title);
+  });
+
+  await t.test("cancellation is exclusive, owned, persistent and audited", async () => {
+    assert.equal((await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie: otherCookie, body: { cancelled: true } })).status, 404);
+    for (const body of [{ completed: true, cancelled: true }, { cancelled: "true" }]) {
+      assert.equal((await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body })).status, 400);
+    }
+    const cancelled = await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body: { cancelled: true } });
+    assert.equal(cancelled.status, 200, cancelled.data.error);
+    assert.equal(cancelled.data.task.cancelled, true);
+    assert.equal(cancelled.data.task.completed, false);
+    assert.equal((await request(`/api/tasks/${taskId}`, { cookie })).data.task.cancelled, true);
+    const beforeNoop = (await request("/api/audit", { cookie })).data.events;
+    assert.equal((await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body: { cancelled: true } })).status, 200);
+    assert.equal((await request("/api/audit", { cookie })).data.events.length, beforeNoop.length);
+    const completed = await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body: { completed: true } });
+    assert.equal(completed.data.task.completed, true);
+    assert.equal(completed.data.task.cancelled, false);
+    const cancelledAgain = await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body: { cancelled: true } });
+    assert.equal(cancelledAgain.data.task.completed, false);
+    assert.equal(cancelledAgain.data.task.cancelled, true);
+    const reopened = await request(`/api/tasks/${taskId}`, { method: "PATCH", cookie, body: { completed: false, cancelled: false } });
+    assert.equal(reopened.data.task.completed, false);
+    assert.equal(reopened.data.task.cancelled, false);
+    const events = (await request("/api/audit", { cookie })).data.events;
+    assert.deepEqual(events.slice(0, 4).map(event => event.action), ["task.reopened", "task.cancelled", "task.completed", "task.cancelled"]);
+    assert.equal(events[0].details.before.cancelled, true);
+    assert.equal(events[0].details.after.cancelled, false);
+    assert.equal(events[1].details.before.completed, true);
+    assert.equal(events[1].details.after.completed, false);
+    assert.equal(events[1].details.after.cancelled, true);
+    assert.equal((await request("/api/audit?action=task.cancelled", { cookie })).data.events.length, 2);
+    assert.deepEqual((await request("/api/audit?action=task.cancelled", { cookie: otherCookie })).data.events, []);
+  });
+
+  await t.test("audit action and date filters apply before stable pagination", async () => {
+    for (const query of ["action=unknown", "action=task.created%27%20OR%201=1", "from=invalid", "from=2026-02-30T00:00:00.000Z", "to=0000-01-01T00:00:00.000Z", "from=2030-01-02T00:00:00Z&to=2030-01-01T00:00:00Z"]) {
+      assert.equal((await request(`/api/audit?${query}`, { cookie })).status, 400);
+    }
+    const initialUpdates = (await request("/api/audit?action=task.updated", { cookie })).data.events.length;
+    const fixture = await request("/api/tasks", { method: "POST", cookie, body: { title: "Проверка страниц истории" } });
+    assert.equal(fixture.status, 201, fixture.data.error);
+    const fixtureId = fixture.data.task.id;
+    try {
+      for (let index = 0; index < 51; index++) {
+        const edited = await request(`/api/tasks/${fixtureId}`, { method: "PATCH", cookie, body: { description: `Изменение ${index}` } });
+        assert.equal(edited.status, 200, edited.data.error);
+      }
+      const window = "from=2000-01-01T00%3A00%3A00.000Z&to=2100-01-01T00%3A00%3A00.000Z";
+      const first = await request(`/api/audit?action=task.updated&${window}`, { cookie });
+      assert.equal(first.status, 200, first.data.error);
+      assert.equal(first.data.events.length, 50);
+      assert.ok(first.data.nextCursor);
+      assert.ok(first.data.events.every(event => event.action === "task.updated"));
+      const second = await request(`/api/audit?action=task.updated&${window}&before=${first.data.nextCursor}`, { cookie });
+      assert.equal(second.status, 200, second.data.error);
+      assert.equal(second.data.nextCursor, null);
+      const combined = [...first.data.events, ...second.data.events];
+      assert.equal(combined.length, initialUpdates + 51);
+      assert.equal(new Set(combined.map(event => event.id)).size, combined.length);
+      assert.ok(second.data.events.every(event => event.action === "task.updated" && BigInt(event.id) < BigInt(first.data.nextCursor)));
+      const registered = await request(`/api/audit?action=user.registered&${window}`, { cookie });
+      assert.equal(registered.data.events.length, 1, "A matching older event must not be lost behind an unfiltered page.");
+      const registeredAt = encodeURIComponent(registered.data.events[0].createdAt);
+      assert.equal((await request(`/api/audit?action=user.registered&from=${registeredAt}`, { cookie })).data.events.length, 1);
+      assert.deepEqual((await request(`/api/audit?action=user.registered&to=${registeredAt}`, { cookie })).data.events, []);
+      assert.deepEqual((await request("/api/audit?from=2100-01-01T00:00:00Z", { cookie })).data.events, []);
+      assert.deepEqual((await request("/api/audit?to=2000-01-01T00:00:00Z", { cookie })).data.events, []);
+    } finally {
+      await request(`/api/tasks/${fixtureId}`, { method: "DELETE", cookie });
+    }
   });
 
   await t.test("logout revokes session; login restores persisted tasks", async () => {

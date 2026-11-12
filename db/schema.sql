@@ -22,8 +22,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   priority varchar(6) NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high')),
   due_date date,
   completed boolean NOT NULL DEFAULT false,
+  cancelled boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  CONSTRAINT tasks_state_check CHECK (NOT (completed AND cancelled))
 );
 CREATE INDEX IF NOT EXISTS tasks_user_idx ON tasks(user_id, created_at DESC);
 
@@ -32,7 +34,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   user_id uuid NOT NULL REFERENCES users(id),
   action varchar(32) NOT NULL CHECK (action IN (
     'user.registered', 'user.logged_in', 'user.logged_out',
-    'task.created', 'task.updated', 'task.completed', 'task.reopened', 'task.deleted'
+    'task.created', 'task.updated', 'task.completed', 'task.cancelled', 'task.reopened', 'task.deleted'
   )),
   task_id uuid,
   task_title text,
@@ -40,6 +42,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX IF NOT EXISTS audit_user_idx ON audit_events(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS audit_user_action_idx ON audit_events(user_id, action, id DESC);
+CREATE INDEX IF NOT EXISTS audit_user_date_idx ON audit_events(user_id, created_at DESC);
 
 CREATE OR REPLACE FUNCTION prevent_audit_modification() RETURNS trigger
 LANGUAGE plpgsql AS $$
