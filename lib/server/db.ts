@@ -1,11 +1,21 @@
-import { env } from "cloudflare:workers";
-import { neon } from "@neondatabase/serverless";
+import pg from "pg";
 
-type DatabaseEnvironment = {
-  DATABASE_URL?: string;
-  DATABASE_HTTP_URL?: string;
-  DATABASE_HTTP_TOKEN?: string;
-};
+const databaseGlobal = globalThis as typeof globalThis & { taskPool?: pg.Pool };
+
+function pool(): pg.Pool {
+  if (!process.env.DATABASE_URL) throw new DatabaseError("NOT_CONFIGURED");
+  if (!databaseGlobal.taskPool) {
+    databaseGlobal.taskPool = new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 10,
+      connectionTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+      statement_timeout: 10000,
+    });
+    databaseGlobal.taskPool.on("error", () => console.error("Idle PostgreSQL connection failed"));
+  }
+  return databaseGlobal.taskPool;
+}
 
 export class DatabaseError extends Error {
   constructor(public readonly code?: string) {
@@ -14,25 +24,11 @@ export class DatabaseError extends Error {
 }
 
 export async function query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
-  const config = env as DatabaseEnvironment;
-  if (config.DATABASE_HTTP_URL && config.DATABASE_HTTP_TOKEN) {
-    const response = await fetch(config.DATABASE_HTTP_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.DATABASE_HTTP_TOKEN}`,
-      },
-      body: JSON.stringify({ query: sql, params }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const data = await response.json() as { rows?: T[]; code?: string };
-    if (!response.ok || !Array.isArray(data.rows)) throw new DatabaseError(data.code);
-    return data.rows;
-  }
-  if (!config.DATABASE_URL) throw new DatabaseError("NOT_CONFIGURED");
   try {
-    return await neon(config.DATABASE_URL).query(sql, params) as T[];
+    const result = await pool().query(sql, params);
+    return result.rows as T[];
   } catch (error) {
+    if (error instanceof DatabaseError) throw error;
     const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
     throw new DatabaseError(code);
   }

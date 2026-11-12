@@ -22,7 +22,11 @@ function json(data: unknown, status = 200, headers?: HeadersInit): Response {
 
 function assertSameOrigin(request: Request): void {
   const origin = request.headers.get("origin");
-  if (origin !== new URL(request.url).origin || request.headers.get("sec-fetch-site") === "cross-site") {
+  const port = process.env.PORT ?? "3000";
+  const localOrigins = [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
+  if (!origin || !localOrigins.includes(origin)
+    || new URL(origin).host !== request.headers.get("host")
+    || request.headers.get("sec-fetch-site") === "cross-site") {
     throw new ApiError(403, "Запрос с другого сайта запрещён.");
   }
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
 
-const base = (process.env.TEST_BASE_URL ?? "http://127.0.0.1:5173").replace(/\/$/, "");
+const base = (process.env.TEST_BASE_URL ?? "http://127.0.0.1:3000").replace(/\/$/, "");
 const origin = new URL(base).origin;
 const suffix = randomBytes(5).toString("hex");
 const username = `qa_a_${suffix}`;
@@ -57,6 +57,10 @@ test("PostgreSQL API: accounts, task lifecycle, ownership, persistence and audit
 
   await t.test("CSRF and input validation reject invalid writes", async () => {
     assert.equal((await request("/api/tasks", { method: "POST", cookie, body: { title: "Forbidden" }, customOrigin: "https://attacker.invalid" })).status, 403);
+    const otherLoopbackOrigin = new URL(origin);
+    otherLoopbackOrigin.hostname = otherLoopbackOrigin.hostname === "localhost" ? "127.0.0.1" : "localhost";
+    assert.equal((await request("/api/tasks", { method: "POST", cookie, body: { title: "Forbidden" }, customOrigin: otherLoopbackOrigin.origin })).status, 403);
+    assert.equal((await request("/api/tasks", { method: "POST", cookie, body: { title: "Forbidden" }, customOrigin: "" })).status, 403);
     for (const body of [{ title: " " }, { title: "x".repeat(201) }, { title: "x", priority: "urgent" }, { title: "x", dueDate: "2026-02-30" }, { title: "x", user_id: "someone" }, { title: "x", description: "x".repeat(5001) }]) {
       assert.equal((await request("/api/tasks", { method: "POST", cookie, body })).status, 400);
     }

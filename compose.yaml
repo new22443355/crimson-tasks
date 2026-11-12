@@ -1,0 +1,45 @@
+name: crimson-tasks-local
+
+services:
+  db:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: crimson_tasks
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run npm run local:up first}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Run npm run local:up first}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/docker-db-init.sh:/docker-entrypoint-initdb.d/10-crimson.sh:ro
+      - ./db/schema.sql:/opt/crimson/schema.sql:ro
+      - ./db/runtime-grants.sql:/opt/crimson/runtime-grants.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=\"$${APP_DB_PASSWORD}\" psql --host=127.0.0.1 --username=test --dbname=crimson_tasks -Atqc 'SELECT 1 FROM users LIMIT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://test:${APP_DB_PASSWORD:?Run npm run local:up first}@db:5432/crimson_tasks
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
