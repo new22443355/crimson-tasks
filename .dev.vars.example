@@ -1,0 +1,4 @@
+# Local Worker -> loopback PostgreSQL bridge. Token must match .env.local.
+DATABASE_HTTP_URL=http://127.0.0.1:5541/query
+DATABASE_HTTP_TOKEN=
+# Hosted Sites: set DATABASE_URL as a secret using a Neon PostgreSQL URL.
